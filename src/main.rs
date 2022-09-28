@@ -2,12 +2,11 @@ use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
 use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
-use tokio::{
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex, Notify,
-    },
-    time::sleep,
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+    Notify,
+    // Notify,
 };
 
 use webrtc::{
@@ -24,6 +23,7 @@ use webrtc::{
     media::{io::h264_reader::H264Reader, Sample},
     peer_connection::{
         configuration::RTCConfiguration,
+        peer_connection_state::RTCPeerConnectionState,
         sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
         signaling_state::RTCSignalingState,
         RTCPeerConnection,
@@ -32,12 +32,12 @@ use webrtc::{
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
 };
 
-const POLITE: bool = true;
+const POLITE: bool = false;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum SocketEvent {
     HOLLER,
-    START,
+    BEGIN,
 }
 
 #[derive(Deserialize)]
@@ -49,7 +49,7 @@ struct MyPayload {
 impl From<SocketEvent> for Event {
     fn from(e: SocketEvent) -> Self {
         match e {
-            SocketEvent::START => Self::Custom("start".to_string()),
+            SocketEvent::BEGIN => Self::Custom("begin".to_string()),
             SocketEvent::HOLLER => Self::Custom("holler".to_string()),
         }
     }
@@ -94,11 +94,9 @@ async fn create_peer_connection(
 
     let notify_tx = Arc::new(Notify::new());
     let notify_video = notify_tx.clone();
-    let _notify_audio = notify_tx.clone();
 
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
-    let _audio_done_tx = done_tx.clone();
 
     let video_track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
@@ -188,6 +186,7 @@ async fn create_peer_connection(
                         ))
                         .await
                         .expect("send candidate");
+                    println!("send candidate!");
                 }
             })
         }))
@@ -199,6 +198,7 @@ async fn create_peer_connection(
     let making_offer_clone = making_offer.clone();
     peer_connection
         .on_negotiation_needed(Box::new(move || {
+            println!("negotiation required!");
             let peer_send = peer_send_clone.clone();
             let peer_connection = peer_connection_clone.clone();
             let making_offer = making_offer_clone.clone();
@@ -217,17 +217,27 @@ async fn create_peer_connection(
                     .send((SocketEvent::HOLLER, serde_json::json!({ "sdp": offer })))
                     .await
                     .expect("send offer");
+                println!("send offer to remote");
             })
         }))
         .await;
 
+    peer_connection
+        .on_peer_connection_state_change(Box::new(move |state| {
+            if state == RTCPeerConnectionState::Connected {
+                notify_tx.notify_waiters();
+            }
+            Box::pin(async {})
+        }))
+        .await;
+
     println!("peer created! listening to socket events");
-    let peer_connection_clone = peer_connection.clone();
     let mut ignore_offer = false;
     while let Some((event, payload, socket)) = socket_recv.recv().await {
         match event {
-            SocketEvent::START => {
-                notify_tx.notify_waiters();
+            SocketEvent::BEGIN => {
+                println!("begin command received!");
+                // notify_tx.notify_waiters();
             }
             SocketEvent::HOLLER => {
                 let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
@@ -236,38 +246,46 @@ async fn create_peer_connection(
                         candidate: Some(candidate),
                         sdp: None,
                     } => {
-                        let candidate_result =
-                            peer_connection_clone.add_ice_candidate(candidate).await;
+                        println!("got candidate");
+                        let candidate_result = peer_connection.add_ice_candidate(candidate).await;
+                        // .expect("add candidate");
                         if !ignore_offer {
                             candidate_result.expect("add candidate")
                         }
+                        println!("add candidate");
                     }
                     MyPayload {
                         candidate: None,
                         sdp: Some(sdp),
                     } => {
+                        println!("got sdp");
                         let offer_collision = (sdp.sdp_type == RTCSdpType::Offer)
                             && (*making_offer.lock().await
-                                || peer_connection_clone.signaling_state()
-                                    != RTCSignalingState::Stable);
+                                || peer_connection.signaling_state() != RTCSignalingState::Stable);
                         ignore_offer = !POLITE && offer_collision;
                         if ignore_offer {
+                            println!("ignoring offer");
                             continue;
                         }
                         let sdp_type = sdp.sdp_type;
-                        peer_connection_clone
+                        peer_connection
                             .set_remote_description(sdp)
-                            .await
-                            .expect("set remote desc");
-
+                            .await.or_else(|f| {
+                                println!("set remote desc {f}");
+                                Ok::<(), ()>(())
+                            }).ok();
+                            // .expect("set remote desc");
+                        println!("set remote desc");
                         if sdp_type == RTCSdpType::Offer {
-                            let answer = peer_connection_clone
+                            let answer = peer_connection
                                 .create_answer(None)
                                 .await
                                 .expect("create answer");
+                            println!("create answer");
                             socket
                                 .emit(SocketEvent::HOLLER, serde_json::json!({ "sdp": answer }))
                                 .expect("send answer");
+                            println!("send answer");
                         }
                     }
                     _ => println!("invalid payload format"),
@@ -285,23 +303,24 @@ fn create_socket(
     let socket_send_clone = socket_send.clone();
     let socket = ClientBuilder::new("http://localhost:3000?uin=BOB&type=MavDrone")
         .on(SocketEvent::HOLLER, move |payload, client| {
-            println!("socket message event");
+            // println!("socket message event");
             match payload {
                 rust_socketio::Payload::Binary(_) => println!("message: got binary data!"),
                 rust_socketio::Payload::String(payload) => {
+                    // println!("payload data: {}", &payload);
                     socket_send_clone
                         .blocking_send((SocketEvent::HOLLER, payload, client))
                         .ok();
                 }
             }
         })
-        .on(SocketEvent::START, move |payload, client| {
-            println!("socket start event");
+        .on(SocketEvent::BEGIN, move |payload, client| {
+            // println!("socket start event");
             match payload {
                 rust_socketio::Payload::Binary(_) => println!("start: got binary data!"),
                 rust_socketio::Payload::String(payload) => {
                     socket_send
-                        .blocking_send((SocketEvent::START, payload, client))
+                        .blocking_send((SocketEvent::BEGIN, payload, client))
                         .ok();
                 }
             }
@@ -310,6 +329,7 @@ fn create_socket(
     println!("socket created! listening to peer events.");
     while let Some((event, data)) = peer_recv.blocking_recv() {
         socket.emit(event, data)?;
+        // println!("sent {event:?} to remote");
     }
     println!("no more peer events to listen for!");
     Ok(Arc::new(socket))
@@ -322,12 +342,8 @@ async fn main() -> Result<()> {
     thread::spawn(move || {
         let _sc = create_socket(socket_send, peer_recv).unwrap();
     });
-    tokio::task::spawn(async move {
-        let _pc = create_peer_connection(peer_send, socket_recv)
-            .await
-            .unwrap();
-    });
-    loop {
-        sleep(Duration::from_secs(1)).await;
-    }
+    let _pc = create_peer_connection(peer_send, socket_recv)
+        .await
+        .unwrap();
+    Ok(())
 }
