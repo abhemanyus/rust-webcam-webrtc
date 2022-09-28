@@ -1,99 +1,61 @@
 use anyhow::Result;
+use rust_socketio::{Client, ClientBuilder, Event};
+use serde::Deserialize;
+use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
+use tokio::{
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Notify,
+    },
+    time::sleep,
+};
 
-use rust_socketio::{ClientBuilder, Payload};
-use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Notify;
-use tokio::time::Duration;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
-use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
-use webrtc::media::io::h264_reader::H264Reader;
-use webrtc::media::Sample;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use webrtc::track::track_local::TrackLocal;
-use webrtc::Error;
-
-const VIDEO_FILE: &str = "./video.mp4";
-
-#[derive(Deserialize, Debug, Serialize)]
-enum MyPayload {
-    candidate(RTCIceCandidate),
-    sdp(RTCSessionDescription),
-}
+use webrtc::{
+    api::{
+        interceptor_registry::register_default_interceptors,
+        media_engine::{MediaEngine, MIME_TYPE_H264},
+        APIBuilder,
+    },
+    ice_transport::{
+        ice_candidate::RTCIceCandidateInit, ice_credential_type::RTCIceCredentialType,
+        ice_server::RTCIceServer,
+    },
+    interceptor::registry::Registry,
+    media::{io::h264_reader::H264Reader, Sample},
+    peer_connection::{
+        configuration::RTCConfiguration,
+        sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
+        RTCPeerConnection,
+    },
+    rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
+    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+};
 
 #[derive(Debug)]
 enum SocketEvent {
-    Start,
-    Message(MyPayload),
+    HOLLER,
+    START,
 }
 
-#[derive(Debug)]
-enum PeerEvent {
-    Message(MyPayload),
+#[derive(Deserialize)]
+struct MyPayload {
+    candidate: Option<RTCIceCandidateInit>,
+    sdp: Option<RTCSessionDescription>,
 }
 
-async fn socket_connect(
-    socket_send: Sender<SocketEvent>,
-    mut peer_recv: Receiver<PeerEvent>,
-) -> Result<()> {
-    let message = socket_send.clone();
-    let socket = ClientBuilder::new("http://localhost:3000?uin=BOB&type=MavDrone")
-        .on("message", move |payload, socket| {
-            if let Payload::String(payload) = payload {
-                let payload: MyPayload = serde_json::from_str(&payload).unwrap();
-                message
-                    .blocking_send(SocketEvent::Message(payload))
-                    .unwrap();
-            }
-        })
-        .on("start", move |payload, socket| {
-            socket_send.blocking_send(SocketEvent::Start).unwrap();
-        })
-        .connect()
-        .expect("unable to connect socket");
-    tokio::spawn(async move {
-        while let Some(peer_event) = peer_recv.recv().await {
-            match peer_event {
-                PeerEvent::Message(MyPayload::candidate(candidate)) => {
-                    socket.emit("message", serde_json::json!({ "candidate": candidate }))
-                }
-                PeerEvent::Message(MyPayload::sdp(sdp)) => {
-                    socket.emit("message", serde_json::json!({ "sdp": sdp }))
-                }
-            }
-            .unwrap();
+impl From<SocketEvent> for Event {
+    fn from(e: SocketEvent) -> Self {
+        match e {
+            SocketEvent::START => Self::Custom("start".to_string()),
+            SocketEvent::HOLLER => Self::Custom("holler".to_string()),
         }
-    });
-    Ok(())
+    }
 }
 
-async fn webrtc_connect(
-    peer_send: Sender<PeerEvent>,
-    mut socket_recv: Receiver<SocketEvent>,
-) -> Result<()> {
-    let video_file = VIDEO_FILE.to_owned();
-
-    if !Path::new(&video_file).exists() {
-        return Err(Error::new(format!("video file: '{}' not exist", video_file)).into());
-    }
-    // Everything below is the WebRTC-rs API! Thanks for using it ❤️.
-
-    // Create a MediaEngine object to configure the supported codec
+async fn create_peer_connection(
+    peer_send: Sender<(SocketEvent, serde_json::Value)>,
+    mut socket_recv: Receiver<(SocketEvent, String, Client)>,
+) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
 
     m.register_default_codecs()?;
@@ -127,61 +89,14 @@ async fn webrtc_connect(
     // Create a new RTCPeerConnection
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
-    let peer_send_clone = peer_send.clone();
-    peer_connection
-        .on_ice_candidate(Box::new(move |candidate| {
-            if let Some(candidate) = candidate {
-                peer_send_clone
-                    .blocking_send(PeerEvent::Message(MyPayload::candidate(candidate)))
-                    .unwrap();
-            }
-            Box::pin(async {})
-        }))
-        .await;
-
-    let peer_send_clone = peer_send.clone();
-    let peer_connection_clone = peer_connection.clone();
-    tokio::spawn(async move {
-        while let Some(payload) = socket_recv.recv().await {
-            match payload {
-                SocketEvent::Message(MyPayload::candidate(candidate)) => {
-                    let candidate = candidate.to_json().await.unwrap();
-                    peer_connection_clone
-                        .add_ice_candidate(candidate)
-                        .await
-                        .unwrap();
-                }
-                SocketEvent::Message(MyPayload::sdp(sdp)) => {
-                    let sdp_type = sdp.sdp_type;
-                    peer_connection_clone
-                        .set_remote_description(sdp)
-                        .await
-                        .unwrap();
-                    if sdp_type == RTCSdpType::Offer {
-                        let answer = peer_connection_clone.create_answer(None).await.unwrap();
-                        peer_connection_clone
-                            .set_local_description(answer.clone())
-                            .await
-                            .unwrap();
-                        peer_send_clone
-                            .send(PeerEvent::Message(MyPayload::sdp(answer)))
-                            .await
-                            .unwrap();
-                    }
-                }
-                SocketEvent::Start => println!("Start streaming!"),
-            };
-        }
-        Result::<()>::Ok(())
-    });
-
     let notify_tx = Arc::new(Notify::new());
     let notify_video = notify_tx.clone();
+    let _notify_audio = notify_tx.clone();
 
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
+    let _audio_done_tx = done_tx.clone();
 
-    // Create a video track
     let video_track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -205,13 +120,14 @@ async fn webrtc_connect(
         Result::<()>::Ok(())
     });
 
-    let video_file_name = video_file.to_owned();
+    let video_file_name = "./output.h264".to_owned();
     tokio::spawn(async move {
         // Open a H264 file and start reading using our H264Reader
         let file = File::open(&video_file_name)?;
         let reader = BufReader::new(file);
         let mut h264 = H264Reader::new(reader);
 
+        println!("waiting to start video feed...");
         // Wait for connection established
         let _ = notify_video.notified().await;
 
@@ -255,55 +171,145 @@ async fn webrtc_connect(
         Result::<()>::Ok(())
     });
 
-    // Set the handler for ICE connection state
-    // This will notify you when the peer has connected/disconnected
+    let peer_send_clone = peer_send.clone();
     peer_connection
-        .on_ice_connection_state_change(Box::new(move |connection_state: RTCIceConnectionState| {
-            println!("Connection State has changed {}", connection_state);
-            if connection_state == RTCIceConnectionState::Connected {
+        .on_ice_candidate(Box::new(move |candidate| {
+            let peer_send = peer_send_clone.clone();
+            Box::pin(async move {
+                if let Some(candidate) = candidate {
+                    let candidate = candidate.to_json().await.expect("candidate to json");
+                    peer_send
+                        .send((
+                            SocketEvent::HOLLER,
+                            serde_json::json!({ "candidate": candidate }),
+                        ))
+                        .await
+                        .expect("send candidate");
+                }
+            })
+        }))
+        .await;
+
+    let peer_send_clone = peer_send.clone();
+    let peer_connection_clone = peer_connection.clone();
+    peer_connection
+        .on_negotiation_needed(Box::new(move || {
+            let peer_send = peer_send_clone.clone();
+            let peer_connection = peer_connection_clone.clone();
+            Box::pin(async move {
+                let offer = peer_connection
+                    .create_offer(None)
+                    .await
+                    .expect("create offer");
+                peer_connection
+                    .set_local_description(offer.clone())
+                    .await
+                    .expect("set local desc");
+                peer_send
+                    .send((SocketEvent::HOLLER, serde_json::json!({ "sdp": offer })))
+                    .await
+                    .expect("send offer");
+            })
+        }))
+        .await;
+
+    println!("peer created! listening to socket events");
+    let peer_connection_clone = peer_connection.clone();
+    while let Some((event, payload, socket)) = socket_recv.recv().await {
+        match event {
+            SocketEvent::START => {
                 notify_tx.notify_waiters();
             }
-            Box::pin(async {})
-        }))
-        .await;
+            SocketEvent::HOLLER => {
+                let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
+                match payload {
+                    MyPayload {
+                        candidate: Some(candidate),
+                        sdp: None,
+                    } => {
+                        peer_connection_clone
+                            .add_ice_candidate(candidate)
+                            .await
+                            .expect("add candidate");
+                    }
+                    MyPayload {
+                        candidate: None,
+                        sdp: Some(sdp),
+                    } => {
+                        let sdp_type = sdp.sdp_type;
+                        peer_connection_clone
+                            .set_remote_description(sdp)
+                            .await
+                            .expect("set remote desc");
 
-    // Set the handler for Peer connection state
-    // This will notify you when the peer has connected/disconnected
-    peer_connection
-        .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-            println!("Peer Connection State has changed: {}", s);
-
-            if s == RTCPeerConnectionState::Failed {
-                // Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
-                // Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
-                // Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
-                println!("Peer Connection has gone to failed exiting");
-                let _ = done_tx.try_send(());
+                        if sdp_type == RTCSdpType::Offer {
+                            let answer = peer_connection_clone
+                                .create_answer(None)
+                                .await
+                                .expect("create answer");
+                            socket
+                                .emit(SocketEvent::HOLLER, serde_json::json!({ "sdp": answer }))
+                                .expect("send answer");
+                        }
+                    }
+                    _ => println!("invalid payload format"),
+                }
             }
-
-            Box::pin(async {})
-        }))
-        .await;
-
-    println!("Press ctrl-c to stop");
-    tokio::select! {
-        _ = done_rx.recv() => {
-            println!("received done signal!");
         }
-        _ = tokio::signal::ctrl_c() => {
-            println!("");
-        }
-    };
+    }
+    Ok(peer_connection)
+}
 
-    peer_connection.close().await?;
-    Ok(())
+fn create_socket(
+    socket_send: Sender<(SocketEvent, String, Client)>,
+    mut peer_recv: Receiver<(SocketEvent, serde_json::Value)>,
+) -> Result<Arc<Client>> {
+    let socket_send_clone = socket_send.clone();
+    let socket = ClientBuilder::new("http://localhost:3000?uin=BOB&type=MavDrone")
+        .on(SocketEvent::HOLLER, move |payload, client| {
+            println!("socket message event");
+            match payload {
+                rust_socketio::Payload::Binary(_) => println!("message: got binary data!"),
+                rust_socketio::Payload::String(payload) => {
+                    socket_send_clone
+                        .blocking_send((SocketEvent::HOLLER, payload, client))
+                        .ok();
+                }
+            }
+        })
+        .on(SocketEvent::START, move |payload, client| {
+            println!("socket start event");
+            match payload {
+                rust_socketio::Payload::Binary(_) => println!("start: got binary data!"),
+                rust_socketio::Payload::String(payload) => {
+                    socket_send
+                        .blocking_send((SocketEvent::START, payload, client))
+                        .ok();
+                }
+            }
+        })
+        .connect()?;
+    println!("socket created! listening to peer events.");
+    while let Some((event, data)) = peer_recv.blocking_recv() {
+        socket.emit(event, data)?;
+    }
+    println!("no more peer events to listen for!");
+    Ok(Arc::new(socket))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (socket_send, socket_recv) = tokio::sync::mpsc::channel::<SocketEvent>(1);
-    let (peer_send, peer_recv) = tokio::sync::mpsc::channel::<PeerEvent>(1);
-    socket_connect(socket_send, peer_recv).await.unwrap();
-    webrtc_connect(peer_send, socket_recv).await.unwrap();
-    Ok(())
+    let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(1);
+    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(1);
+    thread::spawn(move || {
+        let _sc = create_socket(socket_send, peer_recv).unwrap();
+    });
+    tokio::task::spawn(async move {
+        let _pc = create_peer_connection(peer_send, socket_recv)
+            .await
+            .unwrap();
+    });
+    loop {
+        sleep(Duration::from_secs(1)).await;
+    }
 }
