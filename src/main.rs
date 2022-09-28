@@ -5,7 +5,7 @@ use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
-        Notify,
+        Mutex, Notify,
     },
     time::sleep,
 };
@@ -25,11 +25,14 @@ use webrtc::{
     peer_connection::{
         configuration::RTCConfiguration,
         sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
+        signaling_state::RTCSignalingState,
         RTCPeerConnection,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
 };
+
+const POLITE: bool = true;
 
 #[derive(Debug)]
 enum SocketEvent {
@@ -192,11 +195,16 @@ async fn create_peer_connection(
 
     let peer_send_clone = peer_send.clone();
     let peer_connection_clone = peer_connection.clone();
+    let making_offer = Arc::new(Mutex::new(false));
+    let making_offer_clone = making_offer.clone();
     peer_connection
         .on_negotiation_needed(Box::new(move || {
             let peer_send = peer_send_clone.clone();
             let peer_connection = peer_connection_clone.clone();
+            let making_offer = making_offer_clone.clone();
             Box::pin(async move {
+                let mut making_offer = making_offer.lock().await;
+                *making_offer = true;
                 let offer = peer_connection
                     .create_offer(None)
                     .await
@@ -215,6 +223,7 @@ async fn create_peer_connection(
 
     println!("peer created! listening to socket events");
     let peer_connection_clone = peer_connection.clone();
+    let mut ignore_offer = false;
     while let Some((event, payload, socket)) = socket_recv.recv().await {
         match event {
             SocketEvent::START => {
@@ -227,15 +236,24 @@ async fn create_peer_connection(
                         candidate: Some(candidate),
                         sdp: None,
                     } => {
-                        peer_connection_clone
-                            .add_ice_candidate(candidate)
-                            .await
-                            .expect("add candidate");
+                        let candidate_result =
+                            peer_connection_clone.add_ice_candidate(candidate).await;
+                        if !ignore_offer {
+                            candidate_result.expect("add candidate")
+                        }
                     }
                     MyPayload {
                         candidate: None,
                         sdp: Some(sdp),
                     } => {
+                        let offer_collision = (sdp.sdp_type == RTCSdpType::Offer)
+                            && (*making_offer.lock().await
+                                || peer_connection_clone.signaling_state()
+                                    != RTCSignalingState::Stable);
+                        ignore_offer = !POLITE && offer_collision;
+                        if ignore_offer {
+                            continue;
+                        }
                         let sdp_type = sdp.sdp_type;
                         peer_connection_clone
                             .set_remote_description(sdp)
