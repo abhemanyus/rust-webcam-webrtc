@@ -1,7 +1,14 @@
 use anyhow::Result;
+use bytes::Bytes;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
-use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
+use std::{
+    // fs::File, 
+    // io::BufReader, 
+    sync::Arc, 
+    thread, 
+    time::Duration
+};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Mutex,
@@ -20,7 +27,10 @@ use webrtc::{
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
-    media::{io::ivf_reader::IVFReader, Sample},
+    media::{
+        // io::ivf_reader::IVFReader, 
+        Sample
+    },
     peer_connection::{
         configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
@@ -31,6 +41,13 @@ use webrtc::{
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
 };
+
+use v4l::buffer::Type;
+use v4l::io::mmap::Stream;
+use v4l::io::traits::CaptureStream;
+use v4l::video::Capture;
+use v4l::Device;
+use v4l::FourCC;
 
 const POLITE: bool = true;
 
@@ -121,28 +138,28 @@ async fn create_peer_connection(
         Result::<()>::Ok(())
     });
 
-    let video_file_name = "./output_vp9.ivf".to_owned();
+    // let video_file_name = "./output_vp9.ivf".to_owned();
     tokio::spawn(async move {
         // Open a H264 file and start reading using our H264Reader
-        let file = File::open(&video_file_name)?;
-        let reader = BufReader::new(file);
-        let (mut ivf, header) = IVFReader::new(reader)?;
-
+        // let file = File::open(&video_file_name)?;
+        // let reader = BufReader::new(file);
+        // let (mut ivf, header) = IVFReader::new(reader)?;
+        let mut dev = Device::with_path("/dev/video0")?;
         println!("waiting to start video feed...");
         // Wait for connection established
         let _ = notify_video.notified().await;
-
-        println!("play video from disk file {}", video_file_name);
+        let mut stream = create_stream(&mut dev)?;
+        println!("play video from device {}", "/dev/video0");
 
         // It is important to use a time.Ticker instead of time.Sleep because
         // * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
         // * works around latency issues with Sleep
-        let sleep_time = Duration::from_millis(
-            ((1000 * header.timebase_numerator) / header.timebase_denominator) as u64,
-        );
-        let mut ticker = tokio::time::interval(sleep_time);
+        // let sleep_time = Duration::from_millis(
+        //     ((1000 * header.timebase_numerator) / header.timebase_denominator) as u64,
+        // );
+        // let mut ticker = tokio::time::interval(sleep_time);
         loop {
-            let frame = match ivf.parse_next_frame() {
+            let frame = match stream.next() {
                 Ok((frame, _)) => frame,
                 Err(err) => {
                     println!("All video frames parsed and sent: {}", err);
@@ -161,13 +178,13 @@ async fn create_peer_connection(
 
             video_track
                 .write_sample(&Sample {
-                    data: frame.freeze(),
+                    data: Bytes::copy_from_slice(frame),
                     duration: Duration::from_secs(1),
                     ..Default::default()
                 })
                 .await?;
 
-            let _ = ticker.tick().await;
+            // let _ = ticker.tick().await;
         }
 
         let _ = video_done_tx.try_send(());
@@ -338,6 +355,21 @@ fn create_socket(
     }
     println!("no more peer events to listen for!");
     Ok(Arc::new(socket))
+}
+
+fn create_stream<'a>(dev: &'a mut Device) -> Result<Stream<'a>> {
+    // Let's say we want to explicitly request another format
+    let mut fmt = dev.format()?;
+    fmt.width = 1280;
+    fmt.height = 720;
+    fmt.fourcc = FourCC::new(b"YUYV");
+    dev.set_format(&fmt)?;
+
+    println!("Format in use:\n{}", fmt);
+
+    let stream = Stream::with_buffers(dev, Type::VideoCapture, 4)?;
+
+    Ok(stream)
 }
 
 #[tokio::main]
