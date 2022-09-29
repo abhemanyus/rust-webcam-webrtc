@@ -32,7 +32,7 @@ use webrtc::{
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
 };
 
-const POLITE: bool = false;
+const POLITE: bool = true;
 
 #[derive(Debug, Clone, Copy)]
 enum SocketEvent {
