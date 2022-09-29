@@ -12,7 +12,7 @@ use tokio::sync::{
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_H264},
+        media_engine::{MediaEngine, MIME_TYPE_VP9},
         APIBuilder,
     },
     ice_transport::{
@@ -20,7 +20,7 @@ use webrtc::{
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
-    media::{io::h264_reader::H264Reader, Sample},
+    media::{io::ivf_reader::IVFReader, Sample},
     peer_connection::{
         configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
@@ -100,7 +100,7 @@ async fn create_peer_connection(
 
     let video_track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_H264.to_owned(),
+            mime_type: MIME_TYPE_VP9.to_owned(),
             ..Default::default()
         },
         "video".to_owned(),
@@ -121,12 +121,12 @@ async fn create_peer_connection(
         Result::<()>::Ok(())
     });
 
-    let video_file_name = "./output.h264".to_owned();
+    let video_file_name = "./output_vp9.ivf".to_owned();
     tokio::spawn(async move {
         // Open a H264 file and start reading using our H264Reader
         let file = File::open(&video_file_name)?;
         let reader = BufReader::new(file);
-        let mut h264 = H264Reader::new(reader);
+        let (mut ivf, header) = IVFReader::new(reader)?;
 
         println!("waiting to start video feed...");
         // Wait for connection established
@@ -137,10 +137,13 @@ async fn create_peer_connection(
         // It is important to use a time.Ticker instead of time.Sleep because
         // * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
         // * works around latency issues with Sleep
-        let mut ticker = tokio::time::interval(Duration::from_millis(33));
+        let sleep_time = Duration::from_millis(
+            ((1000 * header.timebase_numerator) / header.timebase_denominator) as u64,
+        );
+        let mut ticker = tokio::time::interval(sleep_time);
         loop {
-            let nal = match h264.next_nal() {
-                Ok(nal) => nal,
+            let frame = match ivf.parse_next_frame() {
+                Ok((frame, _)) => frame,
                 Err(err) => {
                     println!("All video frames parsed and sent: {}", err);
                     break;
@@ -158,7 +161,7 @@ async fn create_peer_connection(
 
             video_track
                 .write_sample(&Sample {
-                    data: nal.data.freeze(),
+                    data: frame.freeze(),
                     duration: Duration::from_secs(1),
                     ..Default::default()
                 })
@@ -270,11 +273,13 @@ async fn create_peer_connection(
                         let sdp_type = sdp.sdp_type;
                         peer_connection
                             .set_remote_description(sdp)
-                            .await.or_else(|f| {
+                            .await
+                            .or_else(|f| {
                                 println!("set remote desc {f}");
                                 Ok::<(), ()>(())
-                            }).ok();
-                            // .expect("set remote desc");
+                            })
+                            .ok();
+                        // .expect("set remote desc");
                         println!("set remote desc");
                         if sdp_type == RTCSdpType::Offer {
                             let answer = peer_connection
