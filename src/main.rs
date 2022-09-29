@@ -1,12 +1,14 @@
 use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
-use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex,
-    Notify,
-    // Notify,
+use std::{sync::Arc, thread};
+use tokio::{
+    net::UdpSocket,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+        Notify,
+    },
 };
 
 use webrtc::{
@@ -20,7 +22,6 @@ use webrtc::{
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
-    media::{io::ivf_reader::IVFReader, Sample},
     peer_connection::{
         configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
@@ -29,7 +30,10 @@ use webrtc::{
         RTCPeerConnection,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+    track::track_local::{
+        track_local_static_rtp::TrackLocalStaticRTP, TrackLocal, TrackLocalWriter,
+    },
+    Error,
 };
 
 const POLITE: bool = true;
@@ -98,7 +102,7 @@ async fn create_peer_connection(
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
 
-    let video_track = Arc::new(TrackLocalStaticSample::new(
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_VP9.to_owned(),
             ..Default::default()
@@ -121,58 +125,27 @@ async fn create_peer_connection(
         Result::<()>::Ok(())
     });
 
-    let video_file_name = "./output_vp9.ivf".to_owned();
+    let listener = UdpSocket::bind("127.0.0.1:5004").await?;
     tokio::spawn(async move {
-        // Open a H264 file and start reading using our H264Reader
-        let file = File::open(&video_file_name)?;
-        let reader = BufReader::new(file);
-        let (mut ivf, header) = IVFReader::new(reader)?;
-
         println!("waiting to start video feed...");
         // Wait for connection established
         let _ = notify_video.notified().await;
 
-        println!("play video from disk file {}", video_file_name);
-
-        // It is important to use a time.Ticker instead of time.Sleep because
-        // * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-        // * works around latency issues with Sleep
-        let sleep_time = Duration::from_millis(
-            ((1000 * header.timebase_numerator) / header.timebase_denominator) as u64,
-        );
-        let mut ticker = tokio::time::interval(sleep_time);
-        loop {
-            let frame = match ivf.parse_next_frame() {
-                Ok((frame, _)) => frame,
-                Err(err) => {
-                    println!("All video frames parsed and sent: {}", err);
-                    break;
+        println!("play video from udp");
+        let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
+        while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
+            if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
+                if Error::ErrClosedPipe == err {
+                    // The peerConnection has been closed.
+                } else {
+                    println!("video_track write err: {}", err);
                 }
-            };
-
-            /*println!(
-                "PictureOrderCount={}, ForbiddenZeroBit={}, RefIdc={}, UnitType={}, data={}",
-                nal.picture_order_count,
-                nal.forbidden_zero_bit,
-                nal.ref_idc,
-                nal.unit_type,
-                nal.data.len()
-            );*/
-
-            video_track
-                .write_sample(&Sample {
-                    data: frame.freeze(),
-                    duration: Duration::from_secs(1),
-                    ..Default::default()
-                })
-                .await?;
-
-            let _ = ticker.tick().await;
+                let _ = done_tx.try_send(());
+                return;
+            }
         }
 
         let _ = video_done_tx.try_send(());
-
-        Result::<()>::Ok(())
     });
 
     let peer_send_clone = peer_send.clone();

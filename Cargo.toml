@@ -7,8 +7,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.65"
-gstreamer = "0.18.8"
-once_cell = "1.15.0"
 rust_socketio = "0.3.1"
 serde = { version = "1.0.145", features = ["derive"] }
 serde_json = "1.0.85"
