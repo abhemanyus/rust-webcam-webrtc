@@ -7,14 +7,14 @@ use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
         Mutex,
-        Notify,
+        // Notify,
     },
 };
 
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_VP9},
+        media_engine::{MediaEngine, MIME_TYPE_VP8},
         APIBuilder,
     },
     ice_transport::{
@@ -96,15 +96,15 @@ async fn create_peer_connection(
     // Create a new RTCPeerConnection
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
-    let notify_tx = Arc::new(Notify::new());
-    let notify_video = notify_tx.clone();
+    // let notify_tx = Arc::new(Notify::new());
+    // let notify_video = notify_tx.clone();
 
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
 
     let video_track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_VP9.to_owned(),
+            mime_type: MIME_TYPE_VP8.to_owned(),
             ..Default::default()
         },
         "video".to_owned(),
@@ -127,16 +127,12 @@ async fn create_peer_connection(
 
     let listener = UdpSocket::bind("127.0.0.1:5004").await?;
     tokio::spawn(async move {
-        println!("waiting to start video feed...");
-        // Wait for connection established
-        let _ = notify_video.notified().await;
-
         println!("play video from udp");
         let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
         while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
             if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
                 if Error::ErrClosedPipe == err {
-                    // The peerConnection has been closed.
+                    println!("The peerConnection has been closed.");
                 } else {
                     println!("video_track write err: {}", err);
                 }
@@ -201,7 +197,8 @@ async fn create_peer_connection(
     peer_connection
         .on_peer_connection_state_change(Box::new(move |state| {
             if state == RTCPeerConnectionState::Connected {
-                notify_tx.notify_waiters();
+                println!("Connected!");
+                // notify_tx.notify_waiters();
             }
             Box::pin(async {})
         }))
@@ -213,7 +210,6 @@ async fn create_peer_connection(
         match event {
             SocketEvent::BEGIN => {
                 println!("begin command received!");
-                // notify_tx.notify_waiters();
             }
             SocketEvent::HOLLER => {
                 let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
