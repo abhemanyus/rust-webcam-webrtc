@@ -1,14 +1,12 @@
 use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
-use std::{sync::Arc, thread, process::Stdio};
+use std::{sync::Arc, thread};
 use tokio::{
     net::UdpSocket,
-    process::{Command, Child},
     sync::{
         mpsc::{self, Receiver, Sender},
-        Mutex,
-        // Notify,
+        Mutex, Notify,
     },
 };
 
@@ -36,6 +34,9 @@ use webrtc::{
     },
     Error,
 };
+
+use gst::prelude::*;
+use gstreamer as gst;
 
 const POLITE: bool = true;
 
@@ -97,8 +98,8 @@ async fn create_peer_connection(
     // Create a new RTCPeerConnection
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
-    // let notify_tx = Arc::new(Notify::new());
-    // let notify_video = notify_tx.clone();
+    let notify_tx = Arc::new(Notify::new());
+    let notify_video = notify_tx.clone();
 
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
@@ -127,8 +128,9 @@ async fn create_peer_connection(
     });
 
     tokio::spawn(async move {
-        let mut command = start_stream().expect("failed to start stream");
+        let _ = notify_video.notified().await;
         let listener = UdpSocket::bind("127.0.0.1:5004").await.expect("failed to listen");
+        let pipeline = start_stream("rtmp://127.0.0.1:5004").expect("failed to start stream");
         println!("play video from udp");
         let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
         while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
@@ -144,7 +146,7 @@ async fn create_peer_connection(
         }
 
         let _ = video_done_tx.try_send(());
-        command.kill().await.expect("failed to stop stream");
+        pipeline.set_state(gst::State::Null).expect("stop pipeline");
     });
 
     let peer_send_clone = peer_send.clone();
@@ -201,7 +203,6 @@ async fn create_peer_connection(
         .on_peer_connection_state_change(Box::new(move |state| {
             if state == RTCPeerConnectionState::Connected {
                 println!("Connected!");
-                // notify_tx.notify_waiters();
             }
             Box::pin(async {})
         }))
@@ -213,6 +214,7 @@ async fn create_peer_connection(
         match event {
             SocketEvent::BEGIN => {
                 println!("begin command received!");
+                notify_tx.notify_waiters();
             }
             SocketEvent::HOLLER => {
                 let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
@@ -312,34 +314,70 @@ fn create_socket(
     Ok(Arc::new(socket))
 }
 
-fn start_stream() -> Result<Child> {
-    let command = Command::new("ffmpeg").args(&[
-        // "-re",
-        "-f",
-        "v4l2",
-        "-i",
-        "/dev/video0",
-        "-vcodec",
-        "libvpx",
-        "-cpu-used",
-        "5",
-        "-deadline",
-        "1",
-        "-g",
-        "10",
-        "-error-resilient",
-        "1",
-        "-auto-alt-ref",
-        "1",
-        "-f",
-        "rtp",
-        "rtp://127.0.0.1:5004?pkt_size=1200",
-    ])
-    .stdout(Stdio::null())
-    .stdin(Stdio::null())
-    // .stderr(Stdio::null())
-    .spawn()?;
-    Ok(command)
+fn start_stream(rtmp_uri: &str) -> Result<gst::Pipeline> {
+    gst::init().unwrap();
+
+    let source = gst::ElementFactory::make("v4l2src", Some("source")).expect("create source");
+    let video_convert =
+        gst::ElementFactory::make("videoconvert", Some("videoconvert")).expect("create encoder");
+    let x264enc = gst::ElementFactory::make("x264enc", Some("x264enc")).expect("create encoder");
+    let flvmux = gst::ElementFactory::make("flvmux", Some("flvmux")).expect("create muxer");
+    let video_sink =
+        gst::ElementFactory::make("rtmpsink", Some("video_sink")).expect("create sink");
+
+    // source.set_property_from_str("device", "/dev/video0");
+    flvmux.set_property("streamable", true);
+    video_sink.set_property_from_str("location", rtmp_uri);
+
+    let pipeline = gst::Pipeline::new(Some("live-pipe"));
+
+    pipeline
+        .add_many(&[&source, &video_convert, &x264enc, &flvmux, &video_sink])
+        .expect("setup pipeline");
+    gst::Element::link_many(&[&source, &video_convert, &x264enc, &flvmux, &video_sink])
+        .expect("link elements");
+
+    pipeline.set_state(gst::State::Null).expect("stop pipeline");
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .expect("start pipeline");
+    let pipeline_clone = pipeline.clone();
+    thread::spawn(move || {
+        let bus = pipeline_clone.bus().unwrap();
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            use gst::MessageView;
+            match msg.view() {
+                MessageView::Eos(eos) => {
+                    println!("source exhausted! {eos:?}");
+                    break;
+                }
+                MessageView::Error(err) => {
+                    println!(
+                        "error from element {:?} {}",
+                        err.src().map(|s| s.path_string()),
+                        err.error()
+                    );
+                    break;
+                }
+                MessageView::StateChanged(state) => {
+                    if state.src().map(|s| s == pipeline_clone).unwrap_or(false) {
+                        println!(
+                            "state changed from {:?} to {:?}",
+                            state.old(),
+                            state.current()
+                        );
+                    }
+                }
+                _ => (),
+            }
+        }
+        pipeline_clone
+            .set_state(gst::State::Null)
+            .expect("stop pipeline");
+    });
+
+    Ok(pipeline)
 }
 
 #[tokio::main]
