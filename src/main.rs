@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
-use std::{sync::Arc, thread};
+use std::{sync::Arc, thread, process::Stdio};
 use tokio::{
     net::UdpSocket,
+    process::{Command, Child},
     sync::{
         mpsc::{self, Receiver, Sender},
         Mutex,
@@ -125,8 +126,9 @@ async fn create_peer_connection(
         Result::<()>::Ok(())
     });
 
-    let listener = UdpSocket::bind("127.0.0.1:5004").await?;
     tokio::spawn(async move {
+        let mut command = start_stream().expect("failed to start stream");
+        let listener = UdpSocket::bind("127.0.0.1:5004").await.expect("failed to listen");
         println!("play video from udp");
         let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
         while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
@@ -142,6 +144,7 @@ async fn create_peer_connection(
         }
 
         let _ = video_done_tx.try_send(());
+        command.kill().await.expect("failed to stop stream");
     });
 
     let peer_send_clone = peer_send.clone();
@@ -309,10 +312,40 @@ fn create_socket(
     Ok(Arc::new(socket))
 }
 
+fn start_stream() -> Result<Child> {
+    let command = Command::new("ffmpeg").args(&[
+        // "-re",
+        "-f",
+        "v4l2",
+        "-i",
+        "/dev/video0",
+        "-vcodec",
+        "libvpx",
+        "-cpu-used",
+        "5",
+        "-deadline",
+        "1",
+        "-g",
+        "10",
+        "-error-resilient",
+        "1",
+        "-auto-alt-ref",
+        "1",
+        "-f",
+        "rtp",
+        "rtp://127.0.0.1:5004?pkt_size=1200",
+    ])
+    .stdout(Stdio::null())
+    .stdin(Stdio::null())
+    // .stderr(Stdio::null())
+    .spawn()?;
+    Ok(command)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(1);
-    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(1);
+    let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(4);
+    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(4);
     thread::spawn(move || {
         let _sc = create_socket(socket_send, peer_recv).unwrap();
     });
