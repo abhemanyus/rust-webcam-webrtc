@@ -1,18 +1,21 @@
 use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
-use std::{fs::File, io::BufReader, sync::Arc, thread, time::Duration};
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex,
-    Notify,
-    // Notify,
+use std::{sync::Arc, thread, process::Stdio};
+use tokio::{
+    net::UdpSocket,
+    process::{Command, Child},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+        // Notify,
+    },
 };
 
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_VP9},
+        media_engine::{MediaEngine, MIME_TYPE_VP8},
         APIBuilder,
     },
     ice_transport::{
@@ -20,7 +23,6 @@ use webrtc::{
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
-    media::{io::ivf_reader::IVFReader, Sample},
     peer_connection::{
         configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
@@ -29,7 +31,10 @@ use webrtc::{
         RTCPeerConnection,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+    track::track_local::{
+        track_local_static_rtp::TrackLocalStaticRTP, TrackLocal, TrackLocalWriter,
+    },
+    Error,
 };
 
 const POLITE: bool = true;
@@ -92,15 +97,15 @@ async fn create_peer_connection(
     // Create a new RTCPeerConnection
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
-    let notify_tx = Arc::new(Notify::new());
-    let notify_video = notify_tx.clone();
+    // let notify_tx = Arc::new(Notify::new());
+    // let notify_video = notify_tx.clone();
 
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let video_done_tx = done_tx.clone();
 
-    let video_track = Arc::new(TrackLocalStaticSample::new(
+    let video_track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_VP9.to_owned(),
+            mime_type: MIME_TYPE_VP8.to_owned(),
             ..Default::default()
         },
         "video".to_owned(),
@@ -121,58 +126,25 @@ async fn create_peer_connection(
         Result::<()>::Ok(())
     });
 
-    let video_file_name = "./output_vp9.ivf".to_owned();
     tokio::spawn(async move {
-        // Open a H264 file and start reading using our H264Reader
-        let file = File::open(&video_file_name)?;
-        let reader = BufReader::new(file);
-        let (mut ivf, header) = IVFReader::new(reader)?;
-
-        println!("waiting to start video feed...");
-        // Wait for connection established
-        let _ = notify_video.notified().await;
-
-        println!("play video from disk file {}", video_file_name);
-
-        // It is important to use a time.Ticker instead of time.Sleep because
-        // * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-        // * works around latency issues with Sleep
-        let sleep_time = Duration::from_millis(
-            ((1000 * header.timebase_numerator) / header.timebase_denominator) as u64,
-        );
-        let mut ticker = tokio::time::interval(sleep_time);
-        loop {
-            let frame = match ivf.parse_next_frame() {
-                Ok((frame, _)) => frame,
-                Err(err) => {
-                    println!("All video frames parsed and sent: {}", err);
-                    break;
+        let mut command = start_stream().expect("failed to start stream");
+        let listener = UdpSocket::bind("127.0.0.1:5004").await.expect("failed to listen");
+        println!("play video from udp");
+        let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
+        while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
+            if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
+                if Error::ErrClosedPipe == err {
+                    println!("The peerConnection has been closed.");
+                } else {
+                    println!("video_track write err: {}", err);
                 }
-            };
-
-            /*println!(
-                "PictureOrderCount={}, ForbiddenZeroBit={}, RefIdc={}, UnitType={}, data={}",
-                nal.picture_order_count,
-                nal.forbidden_zero_bit,
-                nal.ref_idc,
-                nal.unit_type,
-                nal.data.len()
-            );*/
-
-            video_track
-                .write_sample(&Sample {
-                    data: frame.freeze(),
-                    duration: Duration::from_secs(1),
-                    ..Default::default()
-                })
-                .await?;
-
-            let _ = ticker.tick().await;
+                let _ = done_tx.try_send(());
+                return;
+            }
         }
 
         let _ = video_done_tx.try_send(());
-
-        Result::<()>::Ok(())
+        command.kill().await.expect("failed to stop stream");
     });
 
     let peer_send_clone = peer_send.clone();
@@ -228,7 +200,8 @@ async fn create_peer_connection(
     peer_connection
         .on_peer_connection_state_change(Box::new(move |state| {
             if state == RTCPeerConnectionState::Connected {
-                notify_tx.notify_waiters();
+                println!("Connected!");
+                // notify_tx.notify_waiters();
             }
             Box::pin(async {})
         }))
@@ -240,7 +213,6 @@ async fn create_peer_connection(
         match event {
             SocketEvent::BEGIN => {
                 println!("begin command received!");
-                // notify_tx.notify_waiters();
             }
             SocketEvent::HOLLER => {
                 let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
@@ -340,10 +312,40 @@ fn create_socket(
     Ok(Arc::new(socket))
 }
 
+fn start_stream() -> Result<Child> {
+    let command = Command::new("ffmpeg").args(&[
+        // "-re",
+        "-f",
+        "v4l2",
+        "-i",
+        "/dev/video0",
+        "-vcodec",
+        "libvpx",
+        "-cpu-used",
+        "5",
+        "-deadline",
+        "1",
+        "-g",
+        "10",
+        "-error-resilient",
+        "1",
+        "-auto-alt-ref",
+        "1",
+        "-f",
+        "rtp",
+        "rtp://127.0.0.1:5004?pkt_size=1200",
+    ])
+    .stdout(Stdio::null())
+    .stdin(Stdio::null())
+    // .stderr(Stdio::null())
+    .spawn()?;
+    Ok(command)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(1);
-    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(1);
+    let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(4);
+    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(4);
     thread::spawn(move || {
         let _sc = create_socket(socket_send, peer_recv).unwrap();
     });
