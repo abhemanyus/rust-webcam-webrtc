@@ -129,8 +129,10 @@ async fn create_peer_connection(
 
     tokio::spawn(async move {
         let _ = notify_video.notified().await;
-        let listener = UdpSocket::bind("127.0.0.1:5004").await.expect("failed to listen");
-        let pipeline = start_stream("rtmp://127.0.0.1:5004").expect("failed to start stream");
+        let listener = UdpSocket::bind("127.0.0.1:5004")
+            .await
+            .expect("failed to listen");
+        let pipeline = start_stream().expect("failed to start stream");
         println!("play video from udp");
         let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
         while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
@@ -203,6 +205,7 @@ async fn create_peer_connection(
         .on_peer_connection_state_change(Box::new(move |state| {
             if state == RTCPeerConnectionState::Connected {
                 println!("Connected!");
+                notify_tx.notify_waiters();
             }
             Box::pin(async {})
         }))
@@ -214,7 +217,6 @@ async fn create_peer_connection(
         match event {
             SocketEvent::BEGIN => {
                 println!("begin command received!");
-                notify_tx.notify_waiters();
             }
             SocketEvent::HOLLER => {
                 let payload: MyPayload = serde_json::from_str(&payload).expect("parse payload");
@@ -314,27 +316,25 @@ fn create_socket(
     Ok(Arc::new(socket))
 }
 
-fn start_stream(rtmp_uri: &str) -> Result<gst::Pipeline> {
+fn start_stream() -> Result<gst::Pipeline> {
     gst::init().unwrap();
 
     let source = gst::ElementFactory::make("v4l2src", Some("source")).expect("create source");
     let video_convert =
-        gst::ElementFactory::make("videoconvert", Some("videoconvert")).expect("create encoder");
-    let x264enc = gst::ElementFactory::make("x264enc", Some("x264enc")).expect("create encoder");
-    let flvmux = gst::ElementFactory::make("flvmux", Some("flvmux")).expect("create muxer");
-    let video_sink =
-        gst::ElementFactory::make("rtmpsink", Some("video_sink")).expect("create sink");
+        gst::ElementFactory::make("videoconvert", Some("videoconvert")).expect("create converter");
+    let vp8enc = gst::ElementFactory::make("vp8enc", Some("vp8enc")).expect("create encoder");
+    let rtp = gst::ElementFactory::make("rtpvp8pay", Some("rtp")).expect("create rtp");
+    let udp_sink = gst::ElementFactory::make("udpsink", Some("udp sink")).expect("create sink");
 
-    // source.set_property_from_str("device", "/dev/video0");
-    flvmux.set_property("streamable", true);
-    video_sink.set_property_from_str("location", rtmp_uri);
+    udp_sink.set_property_from_str("host", "127.0.0.1");
+    udp_sink.set_property_from_str("port", "5004");
 
     let pipeline = gst::Pipeline::new(Some("live-pipe"));
 
     pipeline
-        .add_many(&[&source, &video_convert, &x264enc, &flvmux, &video_sink])
+        .add_many(&[&source, &video_convert, &vp8enc, &rtp, &udp_sink])
         .expect("setup pipeline");
-    gst::Element::link_many(&[&source, &video_convert, &x264enc, &flvmux, &video_sink])
+    gst::Element::link_many(&[&source, &video_convert, &vp8enc, &rtp, &udp_sink])
         .expect("link elements");
 
     pipeline.set_state(gst::State::Null).expect("stop pipeline");
