@@ -2,12 +2,9 @@ use anyhow::Result;
 use rust_socketio::{Client, ClientBuilder, Event};
 use serde::Deserialize;
 use std::{sync::Arc, thread};
-use tokio::{
-    net::UdpSocket,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex, Notify,
-    },
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex, Notify,
 };
 
 use webrtc::{
@@ -35,8 +32,9 @@ use webrtc::{
     Error,
 };
 
-use gst::prelude::*;
+use gst::{element_error, prelude::*};
 use gstreamer as gst;
+use gstreamer_app as gst_app;
 
 const POLITE: bool = true;
 
@@ -129,26 +127,23 @@ async fn create_peer_connection(
 
     tokio::spawn(async move {
         let _ = notify_video.notified().await;
-        let listener = UdpSocket::bind("127.0.0.1:5004")
-            .await
-            .expect("failed to listen");
-        let pipeline = start_stream().expect("failed to start stream");
+        let (video_rtp_send, mut video_rtp_recv) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        thread::spawn(move || {
+            start_stream(video_rtp_send, done_tx).expect("failed to start stream")
+        });
         println!("play video from udp");
-        let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
-        while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
-            if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
+        while let Some(map) = video_rtp_recv.recv().await {
+            if let Err(err) = video_track.write(&map).await {
                 if Error::ErrClosedPipe == err {
                     println!("The peerConnection has been closed.");
                 } else {
                     println!("video_track write err: {}", err);
                 }
-                let _ = done_tx.try_send(());
                 return;
             }
         }
 
         let _ = video_done_tx.try_send(());
-        pipeline.set_state(gst::State::Null).expect("stop pipeline");
     });
 
     let peer_send_clone = peer_send.clone();
@@ -164,7 +159,7 @@ async fn create_peer_connection(
                             serde_json::json!({ "candidate": candidate }),
                         ))
                         .await
-                        .expect("send candidate");
+                        .ok();
                     println!("send candidate!");
                 }
             })
@@ -195,7 +190,7 @@ async fn create_peer_connection(
                 peer_send
                     .send((SocketEvent::HOLLER, serde_json::json!({ "sdp": offer })))
                     .await
-                    .expect("send offer");
+                    .ok();
                 println!("send offer to remote");
             })
         }))
@@ -277,10 +272,7 @@ async fn create_peer_connection(
     Ok(peer_connection)
 }
 
-fn create_socket(
-    socket_send: Sender<(SocketEvent, String, Client)>,
-    mut peer_recv: Receiver<(SocketEvent, serde_json::Value)>,
-) -> Result<Arc<Client>> {
+fn create_socket(socket_send: Sender<(SocketEvent, String, Client)>) -> Result<Client> {
     let socket_send_clone = socket_send.clone();
     let socket = ClientBuilder::new("http://localhost:3000?uin=BOB&type=MavDrone")
         .on(SocketEvent::HOLLER, move |payload, client| {
@@ -290,7 +282,7 @@ fn create_socket(
                 rust_socketio::Payload::String(payload) => {
                     // println!("payload data: {}", &payload);
                     socket_send_clone
-                        .blocking_send((SocketEvent::HOLLER, payload, client))
+                        .try_send((SocketEvent::HOLLER, payload, client))
                         .ok();
                 }
             }
@@ -301,22 +293,17 @@ fn create_socket(
                 rust_socketio::Payload::Binary(_) => println!("start: got binary data!"),
                 rust_socketio::Payload::String(payload) => {
                     socket_send
-                        .blocking_send((SocketEvent::BEGIN, payload, client))
+                        .try_send((SocketEvent::BEGIN, payload, client))
                         .ok();
                 }
             }
         })
         .connect()?;
     println!("socket created! listening to peer events.");
-    while let Some((event, data)) = peer_recv.blocking_recv() {
-        socket.emit(event, data)?;
-        // println!("sent {event:?} to remote");
-    }
-    println!("no more peer events to listen for!");
-    Ok(Arc::new(socket))
+    Ok(socket)
 }
 
-fn start_stream() -> Result<gst::Pipeline> {
+fn start_stream(video_track: Sender<Vec<u8>>, notify: Sender<()>) -> Result<()> {
     gst::init().unwrap();
 
     let source = gst::ElementFactory::make("v4l2src", Some("source")).expect("create source");
@@ -324,69 +311,113 @@ fn start_stream() -> Result<gst::Pipeline> {
         gst::ElementFactory::make("videoconvert", Some("videoconvert")).expect("create converter");
     let vp8enc = gst::ElementFactory::make("vp8enc", Some("vp8enc")).expect("create encoder");
     let rtp = gst::ElementFactory::make("rtpvp8pay", Some("rtp")).expect("create rtp");
-    let udp_sink = gst::ElementFactory::make("udpsink", Some("udp sink")).expect("create sink");
-
-    udp_sink.set_property_from_str("host", "127.0.0.1");
-    udp_sink.set_property_from_str("port", "5004");
+    let app_sink = gst::ElementFactory::make("appsink", Some("udp sink")).expect("create sink");
 
     let pipeline = gst::Pipeline::new(Some("live-pipe"));
 
     pipeline
-        .add_many(&[&source, &video_convert, &vp8enc, &rtp, &udp_sink])
+        .add_many(&[&source, &video_convert, &vp8enc, &rtp, &app_sink])
         .expect("setup pipeline");
-    gst::Element::link_many(&[&source, &video_convert, &vp8enc, &rtp, &udp_sink])
+    gst::Element::link_many(&[&source, &video_convert, &vp8enc, &rtp, &app_sink])
         .expect("link elements");
 
-    pipeline.set_state(gst::State::Null).expect("stop pipeline");
+    let app_sink = app_sink
+        .dynamic_cast::<gst_app::AppSink>()
+        .expect("Sink element is expected to be an appsink!");
+
+    app_sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            // Add a handler to the "new-sample" signal.
+            .new_sample(move |app_sink| {
+                // Pull the sample in question out of the appsink's buffer.
+                let sample = app_sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or_else(|| {
+                    element_error!(
+                        app_sink,
+                        gst::ResourceError::Failed,
+                        ("Failed to get buffer from appsink")
+                    );
+
+                    gst::FlowError::Error
+                })?;
+
+                // At this point, buffer is only a reference to an existing memory region somewhere.
+                // When we want to access its content, we have to map it while requesting the required
+                // mode of access (read, read/write).
+                // This type of abstraction is necessary, because the buffer in question might not be
+                // on the machine's main memory itself, but rather in the GPU's memory.
+                // So mapping the buffer makes the underlying memory region accessible to us.
+                // See: https://gstreamer.freedesktop.org/documentation/plugin-development/advanced/allocation.html
+                let map = buffer.map_readable().map_err(|_| {
+                    element_error!(
+                        app_sink,
+                        gst::ResourceError::Failed,
+                        ("Failed to map buffer readable")
+                    );
+
+                    gst::FlowError::Error
+                })?;
+                // println!("sending track...");
+                video_track.try_send(map.to_vec()).ok();
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
 
     pipeline
         .set_state(gst::State::Playing)
         .expect("start pipeline");
-    let pipeline_clone = pipeline.clone();
-    thread::spawn(move || {
-        let bus = pipeline_clone.bus().unwrap();
-        for msg in bus.iter_timed(gst::ClockTime::NONE) {
-            use gst::MessageView;
-            match msg.view() {
-                MessageView::Eos(eos) => {
-                    println!("source exhausted! {eos:?}");
-                    break;
-                }
-                MessageView::Error(err) => {
-                    println!(
-                        "error from element {:?} {}",
-                        err.src().map(|s| s.path_string()),
-                        err.error()
-                    );
-                    break;
-                }
-                MessageView::StateChanged(state) => {
-                    if state.src().map(|s| s == pipeline_clone).unwrap_or(false) {
-                        println!(
-                            "state changed from {:?} to {:?}",
-                            state.old(),
-                            state.current()
-                        );
-                    }
-                }
-                _ => (),
-            }
-        }
-        pipeline_clone
-            .set_state(gst::State::Null)
-            .expect("stop pipeline");
-    });
 
-    Ok(pipeline)
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(eos) => {
+                println!("source exhausted! {eos:?}");
+                break;
+            }
+            MessageView::Error(err) => {
+                println!(
+                    "error from element {:?} {}",
+                    err.src().map(|s| s.path_string()),
+                    err.error()
+                );
+                break;
+            }
+            MessageView::StateChanged(state) => {
+                if state.src().map(|s| s == pipeline).unwrap_or(false) {
+                    println!(
+                        "state changed from {:?} to {:?}",
+                        state.old(),
+                        state.current()
+                    );
+                }
+            }
+            _ => (),
+        }
+    }
+
+    pipeline.set_state(gst::State::Null).expect("stop pipeline");
+    notify.try_send(()).ok();
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let (socket_send, socket_recv) = mpsc::channel::<(SocketEvent, String, Client)>(4);
-    let (peer_send, peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(4);
+    let (peer_send, mut peer_recv) = mpsc::channel::<(SocketEvent, serde_json::Value)>(4);
+    let notify_socket = Arc::new(Notify::new());
+    let notify_clone = notify_socket.clone();
     thread::spawn(move || {
-        let _sc = create_socket(socket_send, peer_recv).unwrap();
+        let socket = create_socket(socket_send).unwrap();
+        notify_socket.notify_waiters();
+        while let Some((event, data)) = peer_recv.blocking_recv() {
+            socket.emit(event, data).ok();
+            // println!("sent {event:?} to remote");
+        }
+        println!("no more peer events to listen for!");
     });
+    let _ = notify_clone.notified().await;
     let _pc = create_peer_connection(peer_send, socket_recv)
         .await
         .unwrap();
