@@ -33,7 +33,7 @@ pub struct SocketConfig {
 impl Default for SocketConfig {
     fn default() -> Self {
         Self {
-            url: "localhost:3000?uin=BOB&type=MavDrone".to_string(),
+            url: "http://localhost:3000?uin=BOB&type=MavDrone".to_string(),
         }
     }
 }
@@ -46,14 +46,14 @@ pub fn create_socket(
     let socket = ClientBuilder::new(config.url)
         .on(SocketEvent::BEGIN, move |_, _| {
             println!("Received begin event");
-            start_video.notify_waiters();
+            start_video.notify_one();
         })
         .on(SocketEvent::HOLLER, move |payload, _| {
             if let rust_socketio::Payload::String(payload) = payload {
                 match serde_json::from_str::<Payload>(&payload) {
                     Ok(payload) => {
                         println!("Socket received payload");
-                        match sender.try_send(payload) {
+                        match sender.blocking_send(payload) {
                             Ok(_) => println!("Forwarded payload to channel"),
                             Err(err) => println!("Failed to forward payload: {err}"),
                         }

@@ -4,7 +4,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use gstreamer::{traits::ElementExt, State};
 use tokio::{
     join,
     sync::{mpsc::channel, Notify},
@@ -36,9 +37,9 @@ pub async fn setup(config: Config) -> Result<()> {
     let (peer_sender, peer_receiver) = channel::<webrtc::Payload>(1);
     let (video_sender, video_receiver) = channel::<Vec<u8>>(1);
     let start_video = Arc::new(Notify::new());
+    let video_start = start_video.clone();
     let start_socket = Arc::new(Notify::new());
     let socket_start = start_socket.clone();
-    let video_start = start_video.clone();
     let _socket_handle = spawn(move || {
         let socket = loop {
             if let Ok(sock) = socket::create_socket(
@@ -52,7 +53,7 @@ pub async fn setup(config: Config) -> Result<()> {
             sleep(Duration::from_secs(2));
         };
         let _socket_listener_handle = socket::setup_listeners(socket, socket_receiver);
-        start_socket.notify_waiters();
+        start_socket.notify_one();
     });
     socket_start.notified().await;
     let peer_connection = webrtc::create_peer_connection(config.web_rtc).await?;
@@ -62,9 +63,10 @@ pub async fn setup(config: Config) -> Result<()> {
         webrtc::setup_listeners(peer_connection.clone(), peer_receiver, socket_sender).await;
     let webrtc_stream_handle = webrtc::setup_stream(&peer_connection, video_receiver).await?;
     let video = video::create_video(config.video)?;
+    let _video_listener = video::setup_listeners(video.clone(), video_sender)?;
     video_start.notified().await;
-    let _video_listener_handle =
-        video::setup_listeners(video, video_sender).context("pipeline setup failed")?;
+    println!("Starting video");
+    video.set_state(State::Playing)?;
     let (_, _) = join!(webrtc_listener_handle, webrtc_stream_handle);
     Ok(())
 }

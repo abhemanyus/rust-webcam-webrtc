@@ -81,7 +81,7 @@ pub async fn setup_listeners(
     tokio::task::spawn(async move {
         while let Some(payload) = signaling_event.recv().await {
             if let Some(response) = handle_holler(&peer_connection, payload).await {
-                match socket_sender.try_send(response) {
+                match socket_sender.send(response).await {
                     Ok(_) => println!("send response to socket"),
                     Err(err) => println!("Unable to send response to socket: {err}"),
                 }
@@ -150,10 +150,10 @@ pub async fn setup_callbacks(
             Box::pin(async move {
                 if let Some(candidate) = candidate {
                     if let Ok(candidate) = candidate.to_json().await {
-                        match socket_sender.try_send(Payload {
+                        match socket_sender.send(Payload {
                             candidate: Some(candidate),
                             sdp: None,
-                        }) {
+                        }).await {
                             Ok(_) => println!("Sent candidate to socket"),
                             Err(err) => println!("Failed to send candidate to socket: {err}"),
                         }
@@ -181,10 +181,10 @@ pub async fn setup_callbacks(
                     Ok(_) => println!("Set local description"),
                     Err(err) => println!("Failed to set local description: {err}"),
                 }
-                match socket_sender.try_send(Payload {
+                match socket_sender.send(Payload {
                     candidate: None,
                     sdp: Some(offer),
-                }) {
+                }).await {
                     Ok(_) => println!("Send offer to socket"),
                     Err(err) => println!("Failed to send offer to socket {err}"),
                 };
