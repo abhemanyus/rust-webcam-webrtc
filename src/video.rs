@@ -1,7 +1,7 @@
 use anyhow::{format_err, Result};
 use std::thread::spawn;
 
-use gst::{element_error, prelude::*, Pipeline};
+use gst::{element_error, prelude::*, Element, Pipeline};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use tokio::sync::mpsc::Sender;
@@ -17,7 +17,7 @@ impl Default for VideoConfig {
     }
 }
 
-pub fn create_video(config: VideoConfig) -> Result<Pipeline, gst::glib::BoolError> {
+pub fn create_video(config: VideoConfig) -> Result<(Pipeline, Element), gst::glib::BoolError> {
     gst::init().unwrap();
     let source = gst::ElementFactory::make("v4l2src", Some("source"))?;
     let video_convert = gst::ElementFactory::make("videoconvert", Some("videoconvert"))?;
@@ -67,11 +67,11 @@ pub fn create_video(config: VideoConfig) -> Result<Pipeline, gst::glib::BoolErro
             println!("Stopped listening to pipeline");
         });
     }
-    Ok(pipeline)
+    Ok((pipeline, app_sink))
 }
 
-pub fn setup_listeners(pipeline: gst::Pipeline, sender: Sender<Vec<u8>>) -> Result<()> {
-    let app_sink = pipeline
+pub fn setup_listeners(app_sink: gst::Element, sender: Sender<Vec<u8>>) -> Result<()> {
+    let app_sink = app_sink
         .dynamic_cast::<gst_app::AppSink>()
         .map_err(|_| format_err!("Cast to app sink failed"))?;
     app_sink.set_callbacks(

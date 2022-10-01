@@ -62,11 +62,11 @@ pub async fn setup(config: Config) -> Result<()> {
     let webrtc_listener_handle =
         webrtc::setup_listeners(peer_connection.clone(), peer_receiver, socket_sender).await;
     let webrtc_stream_handle = webrtc::setup_stream(&peer_connection, video_receiver).await?;
-    let video = video::create_video(config.video)?;
-    let _video_listener = video::setup_listeners(video.clone(), video_sender)?;
+    let (pipeline, app_sink) = video::create_video(config.video)?;
+    let _video_listener = video::setup_listeners(app_sink, video_sender)?;
     video_start.notified().await;
     println!("Starting video");
-    video.set_state(State::Playing)?;
+    pipeline.set_state(State::Playing)?;
     let (_, _) = join!(webrtc_listener_handle, webrtc_stream_handle);
     Ok(())
 }
