@@ -1,3 +1,4 @@
 /target
 /video.mp4
 /output*
+.env

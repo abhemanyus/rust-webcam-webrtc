@@ -39,9 +39,9 @@ pub struct IceConfig {
 impl Default for IceConfig {
     fn default() -> Self {
         Self {
-            urls: vec!["turn:localhost:5450".to_string()],
-            username: Some("test".to_string()),
-            credential: Some("test".to_string()),
+            urls: vec![env!("WRTC_URL").to_string()],
+            username: Some(env!("WRTC_USERNAME").to_string()),
+            credential: Some(env!("WRTC_PASSWORD").to_string()),
         }
     }
 }
