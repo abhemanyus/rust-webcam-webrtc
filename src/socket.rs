@@ -4,6 +4,7 @@ use std::{
 };
 
 use rust_socketio::{Client, ClientBuilder, Error};
+use serde::Deserialize;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     Notify,
@@ -25,7 +26,7 @@ impl From<SocketEvent> for rust_socketio::Event {
     }
 }
 
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 pub struct SocketConfig {
     url: String,
 }

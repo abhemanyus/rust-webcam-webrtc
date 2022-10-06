@@ -1,4 +1,5 @@
 use anyhow::{format_err, Result};
+use serde::Deserialize;
 use std::thread::spawn;
 
 use gst::{element_error, prelude::*, Element, Pipeline};
@@ -6,7 +7,7 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use tokio::sync::mpsc::Sender;
 
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 pub struct VideoConfig {
     device: Option<String>,
 }

@@ -1,0 +1,15 @@
+{
+    "socket": {
+        "url": "String"
+    },
+    "video": {
+        "device": "Option<String>"
+    },
+    "web_rtc": {
+        "urls": [
+            "Vec<String>"
+        ],
+        "username": "Option<String>",
+        "credential": "Option<String>"
+    }
+}

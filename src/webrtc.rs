@@ -29,7 +29,7 @@ use webrtc::{
     Error,
 };
 
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 pub struct IceConfig {
     urls: Vec<String>,
     username: Option<String>,

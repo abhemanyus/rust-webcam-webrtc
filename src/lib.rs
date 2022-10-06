@@ -1,11 +1,12 @@
 use std::{
     sync::Arc,
     thread::{sleep, spawn},
-    time::Duration,
+    time::Duration, fs,
 };
 
 use anyhow::Result;
 use gstreamer::{traits::ElementExt, State};
+use serde::Deserialize;
 use tokio::{
     join,
     sync::{mpsc::channel, Notify},
@@ -15,7 +16,7 @@ mod socket;
 mod video;
 mod webrtc;
 
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
     socket: socket::SocketConfig,
     video: video::VideoConfig,
@@ -29,6 +30,14 @@ impl Default for Config {
             video: Default::default(),
             web_rtc: Default::default(),
         }
+    }
+}
+
+impl Config {
+    pub fn parse(path: &str) -> Result<Self> {
+        let config = fs::read(path)?;
+        let config: Self = serde_json::from_slice(&config)?;
+        Ok(config)
     }
 }
 
