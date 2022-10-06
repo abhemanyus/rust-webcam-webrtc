@@ -33,7 +33,7 @@ pub struct SocketConfig {
 impl Default for SocketConfig {
     fn default() -> Self {
         Self {
-            url: env!("SOCK_URL").to_string(),
+            url: "http://localhost:3000?uin=BOB&type=MavDrone".to_string(),
         }
     }
 }

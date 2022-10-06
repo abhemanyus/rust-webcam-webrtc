@@ -13,7 +13,7 @@ pub struct VideoConfig {
 
 impl Default for VideoConfig {
     fn default() -> Self {
-        Self { device: Some(env!("VIDEO_SRC").to_string()) }
+        Self { device: None }
     }
 }
 
