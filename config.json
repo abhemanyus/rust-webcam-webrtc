@@ -1,15 +1,15 @@
 {
     "socket": {
-        "url": "String"
+        "url": "http://localhost:3000?uin=BOB&type=MavDrone"
     },
     "video": {
-        "device": "Option<String>"
+        "device": "/dev/video0"
     },
     "web_rtc": {
         "urls": [
-            "Vec<String>"
+            "turn:localhost:5450"
         ],
-        "username": "Option<String>",
-        "credential": "Option<String>"
+        "username": "test",
+        "credential": "test"
     }
 }
