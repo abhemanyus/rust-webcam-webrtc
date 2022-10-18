@@ -1,9 +1,4 @@
-use std::{
-    fs,
-    sync::Arc,
-    thread::{sleep, spawn},
-    time::Duration,
-};
+use std::{fs, sync::Arc, thread::sleep, time::Duration};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -46,14 +41,14 @@ impl Config {
 }
 
 pub async fn setup(config: Config) -> Result<()> {
-    let (socket_sender, socket_receiver) = channel::<wrtc::Payload>(1);
-    let (peer_sender, peer_receiver) = channel::<wrtc::Payload>(1);
-    let (video_sender, video_receiver) = channel::<Vec<u8>>(1);
+    let (socket_sender, socket_receiver) = channel::<wrtc::Payload>(4);
+    let (peer_sender, peer_receiver) = channel::<wrtc::Payload>(4);
+    let (video_sender, video_receiver) = channel::<Vec<u8>>(4);
     let start_video = Arc::new(Notify::new());
     let video_start = start_video.clone();
-    let start_socket = Arc::new(Notify::new());
-    let socket_start = start_socket.clone();
-    let _socket_handle = spawn(move || {
+    // let start_socket = Arc::new(Notify::new());
+    // let socket_start = start_socket.clone();
+    let _socket_handle = tokio::task::spawn_blocking(move || {
         let socket = loop {
             if let Ok(sock) = Socket::new(
                 config.socket.clone(),
@@ -66,9 +61,10 @@ pub async fn setup(config: Config) -> Result<()> {
             sleep(Duration::from_secs(2));
         };
         let _socket_listener_handle = socket.setup_listeners(socket_receiver);
-        start_socket.notify_one();
+        // start_socket.notify_one();
     });
-    socket_start.notified().await;
+    // socket_start.notified().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let peer_connection = WebRTC::new(config.web_rtc).await?;
     peer_connection.setup_callbacks(socket_sender.clone()).await;
     let wrtc_listener_handle = peer_connection
