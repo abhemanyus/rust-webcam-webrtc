@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rust_socketio::{Client, ClientBuilder, Error};
+use rust_socketio::{client::Client, ClientBuilder, Error};
 use serde::Deserialize;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -71,12 +71,12 @@ impl Socket {
         Ok(Self { client: socket })
     }
 
-    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) {
-        // let client = self.client.clone();
-        // tokio::task::spawn_blocking(move || {
+    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) -> tokio::task::JoinHandle<()>{
+        let client = self.client.clone();
+        tokio::task::spawn_blocking(move || {
         while let Some(payload) = receiver.blocking_recv() {
             if let Ok(payload) = serde_json::to_value(payload) {
-                match self.client.emit(SocketEvent::HOLLER, payload) {
+                match client.emit(SocketEvent::HOLLER, payload) {
                     Ok(_) => println!("Sent payload to remote"),
                     Err(err) => println!("Failed to send payload to remote: {err}"),
                 }
@@ -85,6 +85,6 @@ impl Socket {
             }
         }
         println!("Socket stopped listening for events");
-        // })
+        })
     }
 }
