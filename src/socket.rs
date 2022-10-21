@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, thread::{JoinHandle, spawn}};
 
 use rust_socketio::{client::Client, ClientBuilder, Error};
 use serde::Deserialize;
@@ -71,9 +71,9 @@ impl Socket {
         Ok(Self { client: socket })
     }
 
-    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) -> tokio::task::JoinHandle<()>{
+    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) -> JoinHandle<()>{
         let client = self.client.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn(move || {
         while let Some(payload) = receiver.blocking_recv() {
             if let Ok(payload) = serde_json::to_value(payload) {
                 match client.emit(SocketEvent::HOLLER, payload) {
