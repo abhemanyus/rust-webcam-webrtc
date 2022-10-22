@@ -41,9 +41,9 @@ impl Config {
 }
 
 pub async fn setup(config: Config) -> Result<()> {
-    let (socket_sender, socket_receiver) = channel::<wrtc::Payload>(4);
-    let (peer_sender, peer_receiver) = channel::<wrtc::Payload>(4);
-    let (video_sender, video_receiver) = channel::<Vec<u8>>(4);
+    let (socket_sender, socket_receiver) = channel::<wrtc::Payload>(1);
+    let (peer_sender, peer_receiver) = channel::<wrtc::Payload>(1);
+    let (video_sender, video_receiver) = channel::<Vec<u8>>(1);
     let start_video = Arc::new(Notify::new());
     let video_start = start_video.clone();
     let _socket_handle = spawn(move || {
