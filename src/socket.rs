@@ -1,4 +1,7 @@
-use std::{sync::Arc, thread::{JoinHandle, spawn}};
+use std::{
+    sync::Arc,
+    thread::{spawn, JoinHandle},
+};
 
 use rust_socketio::{client::Client, ClientBuilder, Error};
 use serde::Deserialize;
@@ -71,20 +74,20 @@ impl Socket {
         Ok(Self { client: socket })
     }
 
-    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) -> JoinHandle<()>{
+    pub fn setup_listeners(&self, mut receiver: Receiver<Payload>) -> JoinHandle<()> {
         let client = self.client.clone();
         spawn(move || {
-        while let Some(payload) = receiver.blocking_recv() {
-            if let Ok(payload) = serde_json::to_value(payload) {
-                match client.emit(SocketEvent::HOLLER, payload) {
-                    Ok(_) => println!("Sent payload to remote"),
-                    Err(err) => println!("Failed to send payload to remote: {err}"),
+            while let Some(payload) = receiver.blocking_recv() {
+                if let Ok(payload) = serde_json::to_value(payload) {
+                    match client.emit(SocketEvent::HOLLER, payload) {
+                        Ok(_) => println!("Sent payload to remote"),
+                        Err(err) => println!("Failed to send payload to remote: {err}"),
+                    }
+                } else {
+                    println!("Failed to parse payload to json");
                 }
-            } else {
-                println!("Failed to parse payload to json");
             }
-        }
-        println!("Socket stopped listening for events");
+            println!("Socket stopped listening for events");
         })
     }
 }

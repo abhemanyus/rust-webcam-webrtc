@@ -2,7 +2,7 @@ use anyhow::{format_err, Result};
 use serde::Deserialize;
 use std::thread::spawn;
 
-use gst::{element_error, prelude::*, Element, Pipeline, State};
+use gst::{element_error, prelude::*, Element, Pipeline, State, Buffer};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use tokio::sync::mpsc::Sender;
@@ -77,7 +77,7 @@ impl Video {
         Ok(Self { pipeline, app_sink })
     }
 
-    pub fn setup_listeners(&self, sender: Sender<Vec<u8>>) -> Result<()> {
+    pub fn setup_listeners(&self, sender: Sender<Buffer>) -> Result<()> {
         // let app_sink = self.app_sink.take().ok_or(format_err!("app sink already taken!"))?;
         let app_sink = self
             .app_sink
@@ -88,7 +88,7 @@ impl Video {
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |app_sink| {
                     let sample = app_sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let buffer = sample.buffer().ok_or_else(|| {
+                    let buffer = sample.buffer_owned().ok_or_else(|| {
                         element_error!(
                             app_sink,
                             gst::ResourceError::Failed,
@@ -97,16 +97,16 @@ impl Video {
 
                         gst::FlowError::Error
                     })?;
-                    let map = buffer.map_readable().map_err(|_| {
-                        element_error!(
-                            app_sink,
-                            gst::ResourceError::Failed,
-                            ("Failed to map buffer readable")
-                        );
+                    // let map = buffer.map_readable().map_err(|_| {
+                    //     element_error!(
+                    //         app_sink,
+                    //         gst::ResourceError::Failed,
+                    //         ("Failed to map buffer readable")
+                    //     );
 
-                        gst::FlowError::Error
-                    })?;
-                    sender.blocking_send(map.to_vec()).ok(); // todo: handle error when stream closes
+                    //     gst::FlowError::Error
+                    // })?;
+                    sender.blocking_send(buffer).ok(); // todo: handle error when stream closes
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use gstreamer::Buffer;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -210,7 +211,7 @@ impl WebRTC {
 
     pub async fn setup_stream(
         &self,
-        mut stream: Receiver<Vec<u8>>,
+        mut stream: Receiver<Buffer>,
     ) -> Result<JoinHandle<()>, webrtc::Error> {
         let video_track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
@@ -230,13 +231,15 @@ impl WebRTC {
         });
         let handle = tokio::task::spawn(async move {
             while let Some(map) = stream.recv().await {
-                if let Err(err) = video_track.write(&map).await {
-                    if Error::ErrClosedPipe == err {
-                        println!("The peerConnection has been closed.");
-                    } else {
-                        println!("video_track write err: {}", err);
+                if let Ok(buf) = map.map_readable() {
+                    if let Err(err) = video_track.write(&buf).await {
+                        if Error::ErrClosedPipe == err {
+                            println!("The peerConnection has been closed.");
+                        } else {
+                            println!("video_track write err: {}", err);
+                        }
                     }
-                }
+                };
             }
         });
         Ok(handle)

@@ -1,6 +1,12 @@
-use std::{fs, sync::Arc, thread::{sleep, spawn}, time::Duration};
+use std::{
+    fs,
+    sync::Arc,
+    thread::{sleep, spawn},
+    time::Duration,
+};
 
 use anyhow::Result;
+use gstreamer::Buffer;
 use serde::Deserialize;
 use tokio::{
     join,
@@ -43,7 +49,7 @@ impl Config {
 pub async fn setup(config: Config) -> Result<()> {
     let (socket_sender, socket_receiver) = channel::<wrtc::Payload>(1);
     let (peer_sender, peer_receiver) = channel::<wrtc::Payload>(1);
-    let (video_sender, video_receiver) = channel::<Vec<u8>>(1);
+    let (video_sender, video_receiver) = channel::<Buffer>(1);
     let start_video = Arc::new(Notify::new());
     let video_start = start_video.clone();
     let _socket_handle = spawn(move || {
