@@ -9,7 +9,7 @@ use tokio::{
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
-        media_engine::{MediaEngine, MIME_TYPE_VP8},
+        media_engine::{MediaEngine, MIME_TYPE_H264},
         APIBuilder,
     },
     ice_transport::{
@@ -215,7 +215,7 @@ impl WebRTC {
     ) -> Result<JoinHandle<()>, webrtc::Error> {
         let video_track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_VP8.to_owned(),
+                mime_type: MIME_TYPE_H264.to_owned(),
                 ..Default::default()
             },
             "video".to_owned(),

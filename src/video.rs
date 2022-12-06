@@ -28,8 +28,8 @@ impl Video {
         gst::init().unwrap();
         let source = gst::ElementFactory::make("v4l2src", Some("source"))?;
         let video_convert = gst::ElementFactory::make("videoconvert", Some("videoconvert"))?;
-        let vp8enc = gst::ElementFactory::make("vp8enc", Some("vp8enc"))?;
-        let rtp = gst::ElementFactory::make("rtpvp8pay", Some("rtp"))?;
+        let h264enc = gst::ElementFactory::make("openh264enc", Some("h264enc"))?;
+        let rtp = gst::ElementFactory::make("rtph264pay", Some("rtp"))?;
         let app_sink = gst::ElementFactory::make("appsink", Some("udp sink"))?;
 
         if let Some(device) = config.device {
@@ -37,8 +37,8 @@ impl Video {
         }
 
         let pipeline = gst::Pipeline::new(Some("live-pipe"));
-        pipeline.add_many(&[&source, &video_convert, &vp8enc, &rtp, &app_sink])?;
-        gst::Element::link_many(&[&source, &video_convert, &vp8enc, &rtp, &app_sink])?;
+        pipeline.add_many(&[&source, &video_convert, &h264enc, &rtp, &app_sink])?;
+        gst::Element::link_many(&[&source, &video_convert, &h264enc, &rtp, &app_sink])?;
 
         if let Some(bus) = pipeline.bus() {
             let pipeline_clone = pipeline.clone();
